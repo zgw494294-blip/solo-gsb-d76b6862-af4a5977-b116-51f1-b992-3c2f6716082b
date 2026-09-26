@@ -41,6 +41,16 @@ POST /v1/inspect-next
   ROBDD 精确计算，不枚举事件状态；P(E)=0、候选非法或累计非终端
   节点超过 50000 时返回 422。
 
+POST /v1/likely-cause
+  另收 observations（0~16 个，可为空，格式同 /v1/diagnose）。
+  令 C 为顶事件发生且全部读数成立；在满足 C 的完整事件真假赋值
+  A 中，按各事件独立先验乘积选 P(A) 最大者，并列时按事件 id
+  字典序比较真假序列、false 优先。返回按 id 排列的 assignment、
+  condition_probability=P(C) 与 assignment_posterior=P(A)/P(C)，
+  分数均约分。共享引用、NOT 门与未被结构约束的事件都参与赋值及
+  概率计算；复用 ROBDD 精确求最优赋值，不枚举事件状态；P(C)=0
+  或累计非终端节点超过 50000 时返回 422。
+
 所有错误输入（未知引用、环、非法概率、节点超限等）统一返回 422。
 """
 
@@ -57,6 +67,7 @@ from pydantic.config import ConfigDict
 
 from .bdd import MAX_NONTERMINAL_NODES, NodeLimitExceeded, ROBDD
 from .cutsets import compute_cut_set_families
+from .likely import most_likely_assignment
 from .repair import best_repair
 
 app = FastAPI(
@@ -180,6 +191,33 @@ class InspectNextResponse(BaseModel):
     top_posterior: str = Field(..., description="P(top|E)，约分 n/d")
     candidates: List[InspectCandidate]
     recommended_id: str
+
+
+class LikelyCauseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    events: List[EventIn] = Field(..., min_length=1, max_length=32)
+    gates: List[GateIn] = Field(default_factory=list, max_length=64)
+    top: str = Field(..., min_length=1, description="顶层节点 id（事件或门）")
+    observations: Dict[str, StrictBool] = Field(
+        default_factory=dict,
+        max_length=16,
+        description=(
+            "已有读数：0~16 个已声明事件或门 id 到严格布尔值的映射，可为空"
+        ),
+    )
+
+
+class LikelyCauseResponse(BaseModel):
+    assignment: Dict[str, StrictBool] = Field(
+        ..., description="P(A) 最大的完整事件赋值，按事件 id 字典序排列"
+    )
+    condition_probability: str = Field(
+        ..., description="P(C)：顶事件发生且全部读数成立的概率，约分 n/d"
+    )
+    assignment_posterior: str = Field(
+        ..., description="P(A)/P(C)，约分 n/d"
+    )
 
 
 def _bad_request(reason: str) -> JSONResponse:
@@ -673,6 +711,73 @@ def inspect_next_logic(payload: InspectNextRequest) -> InspectNextResponse:
     )
 
 
+def likely_cause_logic(payload: LikelyCauseRequest) -> LikelyCauseResponse:
+    probs, gate_ops, gate_inputs = _validate_payload(payload)
+    sorted_events = sorted(probs)
+
+    # 观测键必须指向已声明的事件或门（同 /v1/diagnose）
+    known_ids = set(probs) | set(gate_ops)
+    unknown = [k for k in payload.observations if k not in known_ids]
+    if unknown:
+        raise ValueError(
+            "observations 引用了未声明的事件或门 id："
+            + ", ".join(repr(k) for k in unknown)
+        )
+
+    # 被观测的门（即便 top 不可达）也要构建到同一 ROBDD 中
+    observed_gates = tuple(
+        k for k in payload.observations if k in gate_ops
+    )
+    _, bdd, top_node, node_map = build_tree_robdd(
+        probs, gate_ops, gate_inputs, payload.top, also=observed_gates
+    )
+
+    # 条件 C：顶事件发生且全部读数成立（同一 ROBDD 上的合取）
+    condition = top_node
+    for obs_id, value in payload.observations.items():
+        lit = node_map[obs_id]
+        constraint = lit if value else bdd.negate(lit)
+        condition = bdd.and_(condition, constraint)
+        if condition == 0:
+            # 短路：结构上已不可同时满足，无需继续合取
+            break
+
+    prob_list = [probs[eid] for eid in sorted_events]
+    node_prob = bdd.node_probabilities(prob_list)
+    condition_prob = node_prob[condition]
+
+    if condition_prob == 0:
+        if condition == 0:
+            raise ValueError(
+                "顶事件与观测相互矛盾：顶事件发生且全部读数同时成立在"
+                "结构上不可能（结构约束的合取恒为假），"
+                "condition_probability=0"
+            )
+        raise ValueError(
+            "顶事件发生且全部读数同时成立的联合概率为 0：尽管结构上"
+            "可满足，但按各事件的独立先验概率，任一满足条件的事件状态"
+            "概率都为 0（例如读数要求概率为 0 的事件发生），"
+            "condition_probability=0"
+        )
+
+    # 在满足 C 的完整赋值中取独立先验乘积最大者（ROBDD 动态规划，
+    # 不枚举事件状态）；未被结构约束的事件按自由变量取较可能一侧
+    best_weight, assignment = most_likely_assignment(
+        bdd, condition, prob_list
+    )
+
+    def frac_string(value: Fraction) -> str:
+        return f"{value.numerator}/{value.denominator}"
+
+    return LikelyCauseResponse(
+        assignment={
+            eid: assignment[i] for i, eid in enumerate(sorted_events)
+        },
+        condition_probability=frac_string(condition_prob),
+        assignment_posterior=frac_string(best_weight / condition_prob),
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
@@ -750,4 +855,16 @@ async def inspect_next(payload: InspectNextRequest) -> InspectNextResponse:
         return _bad_request(str(exc))  # type: ignore[return-value]
     except ValueError as exc:
         # 未知引用、环、非法观测键/候选、观测矛盾或联合概率为 0 等语义错误
+        return _bad_request(str(exc))  # type: ignore[return-value]
+
+
+@app.post("/v1/likely-cause", response_model=LikelyCauseResponse)
+async def likely_cause(payload: LikelyCauseRequest) -> LikelyCauseResponse:
+    try:
+        return likely_cause_logic(payload)
+    except NodeLimitExceeded as exc:
+        # 树构建或合取观测约束时累计非终端节点超过限制
+        return _bad_request(str(exc))  # type: ignore[return-value]
+    except ValueError as exc:
+        # 未知引用、环、非法观测键、条件矛盾或联合概率为 0 等语义错误
         return _bad_request(str(exc))  # type: ignore[return-value]
