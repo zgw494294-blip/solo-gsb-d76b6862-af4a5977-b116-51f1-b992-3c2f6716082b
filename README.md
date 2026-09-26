@@ -13,6 +13,9 @@ Birnbaum 重要度（`P(top | 强制该事件=1) − P(top | 强制该事件=0)`
 还提供下一步观测推荐接口 `POST /v1/inspect-next`：在已有读数 `E`（0～16 个，可为空）下，
 对 1～16 个互异、已声明且未被观测的候选事件/门，分别评估“再观测它一次”对顶事件不确定性的
 期望削减（收益），返回各候选的分支概率、顶事件后验与收益，并给出推荐观测对象。
+还提供最可能诱因接口 `POST /v1/likely-cause`：在“顶事件发生且全部读数成立”的条件 `C` 下，
+从所有完整事件真假赋值中按独立先验乘积选出最可能的一个（并列时按事件 id 字典序、`false` 优先），
+返回该赋值、`P(C)` 与它在条件 `C` 下的后验。
 
 ## 快速启动（Docker Compose）
 
@@ -28,6 +31,7 @@ docker compose up --build
 - 修复方案接口：`http://localhost:8000/v1/repair-plan`
 - 联合观测诊断接口：`http://localhost:8000/v1/diagnose`
 - 下一步观测推荐接口：`http://localhost:8000/v1/inspect-next`
+- 最可能诱因接口：`http://localhost:8000/v1/likely-cause`
 - 健康检查：`http://localhost:8000/health`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -348,6 +352,87 @@ curl -X POST http://localhost:8000/v1/inspect-next \
 - `P(E) = 0`（观测矛盾或先验下无正概率支持）、候选重复/未声明/已被观测、
   或累计非终端节点超过 **50000** 时返回 422 并说明原因。
 
+## 最可能诱因示例（POST /v1/likely-cause）
+
+在 `events` / `gates` / `top` 之外，另收 `observations`：**0～16 个**（可为空或省略）
+已声明**事件或门 id** 到**严格布尔值**的映射，格式与校验同 `/v1/inspect-next`。
+令条件 `C` 为“**顶事件发生且全部读数同时成立**”：
+
+- `assignment`：在所有使 `C` 成立的**完整**事件真假赋值 `A` 中，按各事件独立先验的
+  乘积 `P(A) = Π p_i` 或 `(1−p_i)` 取最大者；乘积并列时按事件 id 字典序比较真假序列
+  （`false` 优先）。响应按键（事件 id）升序给出该赋值；
+- `condition_probability`：条件概率 `P(C)`，约分分数；
+- `assignment_posterior`：最优赋值在条件下的后验 `P(A)/P(C)`，约分分数。
+
+同一事件的多处引用共享同一变量、`NOT` 门照常求值；被 BDD 边跳过、结构上不约束取值的
+自由事件同样参与赋值与概率——它们独立取先验因子较大的一侧（恰为 `1/2` 时按并列规则取
+`false`）。计算在条件 ROBDD 上自底向上做一遍动态规划精确求最优赋值，不枚举 `2^n` 种
+事件状态。
+
+仍以电机冷却系统为例。观测“电机未过热，但顶事件确实发生”——既然电机侧无故障，
+最可能的单一诱因就是概率最高的冷却液泄漏（而非概率更低的泵失效）：
+
+```bash
+curl -X POST http://localhost:8000/v1/likely-cause \
+  -H "Content-Type: application/json" \
+  -d '{
+    "events": [
+      {"id": "motor_overheat", "p": "1/100"},
+      {"id": "coolant_loss",  "p": "2/100"},
+      {"id": "pump_fail",     "p": "1/200"}
+    ],
+    "gates": [
+      {"id": "cooling_fail", "op": "OR",
+       "inputs": ["coolant_loss", "pump_fail"]},
+      {"id": "top", "op": "OR",
+       "inputs": ["motor_overheat", "cooling_fail"]}
+    ],
+    "top": "top",
+    "observations": {
+      "motor_overheat": false,
+      "top": true
+    }
+  }'
+```
+
+响应：
+
+```json
+{
+  "assignment": {
+    "coolant_loss": true,
+    "motor_overheat": false,
+    "pump_fail": false
+  },
+  "condition_probability": "24651/1000000",
+  "assignment_posterior": "199/249"
+}
+```
+
+- 满足读数的两个“单故障”完整赋值先验乘积分别为
+  `P(motor_overheat=0, coolant_loss=1, pump_fail=0) = 99/100 · 2/100 · 199/200 = 19701/1000000`
+  与
+  `P(motor_overheat=0, coolant_loss=0, pump_fail=1) = 99/100 · 98/100 · 1/200 = 9702/1000000`，
+  前者更大，故 `assignment` 取 `coolant_loss=true`（双故障状态概率更低，不影响最优）。
+- `condition_probability = P(motor_overheat=0 且 top=1) = 24651/1000000`，同 `/v1/diagnose`
+  的 `evidence_probability`；`assignment_posterior = P(A)/P(C) = (19701/1000000)/(24651/1000000) = 199/249`。
+- 不带任何读数（省略 `observations` 或传 `{}`）时条件 `C` 就是“顶事件发生”本身，例如上例
+  直接返回 `condition_probability = 34651/1000000`、`assignment_posterior = 19701/34651`。
+- 门读数只是结构约束：观测 `cooling_fail=true` 与 `pump_fail=false` 会迫使
+  `coolant_loss=true`，不是三个相互独立的随机事件。
+- 观测值必须是 JSON 布尔 `true`/`false`（`1`、`0`、`"true"` 等一律拒绝）；键必须是已声明
+  的事件或门 id。
+- **`P(C) = 0` 时返回 422** 并说明原因，区分两种情形：
+  - 顶事件与读数在结构上相互矛盾（如顶事件要求 `a=1` 却观测 `a=false`，合取恒为假）；
+  - 结构可满足但按先验没有任何正概率状态支持（如顶事件要求 `p=0/1` 的事件发生，
+    或把 `p=1/1` 的事件读成 `false`）。
+
+结构矛盾的响应示例：
+
+```json
+{ "detail": "条件 C 相互矛盾：顶事件发生与给定的事件/门读数不可能在同一时刻同时满足（结构约束的合取恒为假），condition_probability=0" }
+```
+
 ## 输入格式
 
 | 字段 | 规则 |
@@ -363,6 +448,7 @@ curl -X POST http://localhost:8000/v1/inspect-next \
 | `observations`（仅 `/v1/diagnose`） | 必填，**1～16** 个键值对；键必须是已声明的事件或门 id，值为严格布尔值；表示同一时刻的读数 |
 | `observations`（仅 `/v1/inspect-next`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；表示已有读数 |
 | `candidates`（仅 `/v1/inspect-next`） | 必填，**1～16** 个互异、已声明且未被观测的事件或门 id |
+| `observations`（仅 `/v1/likely-cause`） | 可选，**0～16** 个键值对（可为空或省略），格式同 `/v1/diagnose`；与“顶事件发生”合取构成条件 C |
 
 概率在节点上按 `P(node) = (1-p_v)·P(low) + p_v·P(high)` 自底向上精确传播；
 事件重要度通过“根到节点路径概率质量”单遍传播精确求得。
@@ -371,6 +457,10 @@ curl -X POST http://localhost:8000/v1/inspect-next \
 `/v1/inspect-next` 先合取观测约束得到 `E`，再对每个候选 `X` 构建 `E∧X`、`E∧X∧top` 的合取，
 对唯一表做一次自底向上加权即可同时读出全部根的概率；假分支概率由
 `P(E∧¬X) = P(E) − P(E∧X)` 等减法精确得到，无需构建取反合取。
+`/v1/likely-cause` 先把“顶事件发生”与各读数合取为条件 `C`，再在其 ROBDD 上做一遍
+自底向上的最大乘积动态规划：节点的 `0/1` 两支各乘 `(1−p_v)`/`p_v`，被边跳过的自由
+变量独立取先验因子较大的一侧，等权时 `false` 支按字典序优先；全程只遍历唯一表，
+不枚举事件状态。
 
 ## 错误处理（HTTP 422）
 
@@ -392,9 +482,13 @@ curl -X POST http://localhost:8000/v1/inspect-next \
 - `/v1/inspect-next` 的 `observations` 超过 **16** 个或键/值非法、`candidates` 为空、
   超过 **16** 个、存在重复、引用未声明 id 或候选已被观测（多项问题一并说明）；
 - `/v1/inspect-next` 的 `P(E) = 0`（同 `/v1/diagnose` 的两种情形）；
+- `/v1/likely-cause` 的 `observations` 超过 **16** 个或键/值非法；
+- `/v1/likely-cause` 的 `condition_probability = P(C) = 0`：顶事件与读数结构矛盾
+  （合取恒假），或结构可满足但先验下无正概率支持（如顶事件要求 `p=0` 的事件发生，
+  或把 `p=1` 的事件读成 `false`），响应说明具体原因；
 - ROBDD 构建过程中累计创建的非终端节点超过 **50000** 个
-  （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose` 与 `/v1/inspect-next`，
-  后两者含合取观测约束与候选分支新增的节点）。
+  （`/v1/analyze`、`/v1/repair-plan`、`/v1/diagnose`、`/v1/inspect-next` 与
+  `/v1/likely-cause`，后三者含合取观测/条件约束新增的节点）。
 
 环示例响应：
 
@@ -424,6 +518,7 @@ app/
   bdd.py      # ROBDD：唯一表、ITE 算子、精确概率/重要度与联合证据加权
   cutsets.py  # 最小割集：位掩码割集族、去重吸收、5000 组上限
   repair.py   # 修复方案：ROBDD 上的受限赋值动态规划（成本/修复数/字典序）
+  likely.py   # 最可能诱因：ROBDD 上的最大乘积动态规划（自由变量/假优先字典序）
   main.py     # FastAPI 应用、请求模型与校验
 Dockerfile
 docker-compose.yml
@@ -433,4 +528,5 @@ tests/test_cutsets.py
 tests/test_repair.py
 tests/test_diagnose.py
 tests/test_inspect_next.py
+tests/test_likely_cause.py
 ```
